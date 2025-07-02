@@ -1,0 +1,6 @@
+streamlit
+pdfplumber
+ics
+python-dateutil
+beautifulsoup4
+requests
