@@ -1,0 +1,173 @@
+import streamlit as st
+import pdfplumber
+import hashlib
+import json
+import re
+from datetime import datetime, timedelta
+from ics import Calendar, Event
+from dateutil import parser
+import requests
+from bs4 import BeautifulSoup
+
+# Track processed PDF hashes
+PROCESSED_HASHES_FILE = "processed_files.json"
+try:
+    with open(PROCESSED_HASHES_FILE, "r") as f:
+        processed_hashes = set(json.load(f))
+except FileNotFoundError:
+    processed_hashes = set()
+
+def save_processed_hashes():
+    with open(PROCESSED_HASHES_FILE, "w") as f:
+        json.dump(list(processed_hashes), f)
+
+def hash_file(file_bytes):
+    return hashlib.sha256(file_bytes).hexdigest()
+
+def extract_events_from_text(text):
+    lines = text.split("\n")
+    events = []
+    current_month_year = None
+    date_context = None
+
+    months = ["June", "July", "August", "September", "October"]
+    for line in lines:
+        line = line.strip()
+
+        # Detect month header
+        for month in months:
+            if month in line and "2025" in line:
+                current_month_year = f"{month} 2025"
+
+        date_match = re.match(r"^(\d{1,2})\b", line)
+        if date_match and current_month_year:
+            day = int(date_match.group(1))
+            try:
+                date_context = datetime.strptime(f"{current_month_year} {day}", "%B %Y %d").date()
+            except:
+                continue
+
+        if date_context:
+            keywords = [
+                ("Church School", "08:30"),
+                ("Orthros", "08:30"),
+                ("Divine Liturgy", "09:30"),
+                ("Div. Lit.", "09:30"),
+                ("9th Hour", "18:20"),
+                ("Vespers", "18:30"),
+                ("Paraklesis", "07:00"),
+                ("Men’s Fellowship", "07:00"),
+                ("Choir Practice", "17:30"),
+                ("Noon Catechism", "12:00"),
+                ("Catechism at the Sommer’s", "12:00"),
+            ]
+            for keyword, time_str in keywords:
+                if keyword in line and "No " not in line:
+                    event = Event()
+                    event.name = keyword
+                    event.begin = f"{date_context} {time_str}"
+                    event.duration = timedelta(minutes=60)
+                    events.append(event)
+    return events
+
+def get_latest_calendar_pdf_from_site(page_url):
+    res = requests.get(page_url)
+    soup = BeautifulSoup(res.text, "html.parser")
+
+    pdf_links = [
+        a["href"] for a in soup.find_all("a", href=True)
+        if ".pdf" in a["href"].lower() and (
+            "calendar" in a["href"].lower() or any(month in a["href"] for month in ["June", "July", "August", "September", "October"])
+        )
+    ]
+
+    if not pdf_links:
+        return None
+
+    latest_link = pdf_links[0]
+    if latest_link.startswith("/"):
+        base = requests.utils.urlparse(page_url)
+        latest_link = f"{base.scheme}://{base.netloc}{latest_link}"
+
+    return latest_link
+
+# -------------------- Streamlit UI --------------------
+st.title("📅 St. Thomas Orthodox Church Calendar Importer")
+st.write("Automatically download the latest calendar and export it to a `.ics` file.")
+
+# Auto-Fetch Button
+if st.button("🔄 Auto-Fetch & Import Latest Church Calendar"):
+    with st.spinner("Checking for new calendar..."):
+        calendar_page = "https://www.orthodoxsnohomish.com/welcome/calendar"
+        pdf_url = get_latest_calendar_pdf_from_site(calendar_page)
+
+        if not pdf_url:
+            st.error("Could not find a calendar PDF link on the page.")
+        else:
+            response = requests.get(pdf_url)
+            file_bytes = response.content
+            file_hash = hash_file(file_bytes)
+
+            if file_hash in processed_hashes:
+                st.warning("This calendar was already processed. Skipping.")
+            else:
+                with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+                    full_text = ""
+                    for page in pdf.pages:
+                        full_text += page.extract_text() + "\n"
+
+                events = extract_events_from_text(full_text)
+
+                if events:
+                    cal = Calendar()
+                    for ev in events:
+                        cal.events.add(ev)
+
+                    ics_filename = "st_thomas_church_calendar.ics"
+                    with open(ics_filename, "w") as f:
+                        f.writelines(cal)
+
+                    with open(ics_filename, "rb") as f:
+                        st.success(f"✅ Found {len(events)} events.")
+                        st.download_button("📥 Download .ics Calendar", f, file_name=ics_filename)
+
+                    processed_hashes.add(file_hash)
+                    save_processed_hashes()
+                else:
+                    st.info("No events were detected in the calendar.")
+
+# Manual Upload Option
+st.markdown("---")
+uploaded_file = st.file_uploader("Or manually upload a calendar PDF", type="pdf")
+
+if uploaded_file:
+    file_bytes = uploaded_file.read()
+    file_hash = hash_file(file_bytes)
+
+    if file_hash in processed_hashes:
+        st.warning("This file has already been processed.")
+    else:
+        with pdfplumber.open(uploaded_file) as pdf:
+            full_text = ""
+            for page in pdf.pages:
+                full_text += page.extract_text() + "\n"
+
+        events = extract_events_from_text(full_text)
+
+        if events:
+            cal = Calendar()
+            for ev in events:
+                cal.events.add(ev)
+
+            ics_filename = "uploaded_church_calendar.ics"
+            with open(ics_filename, "w") as f:
+                f.writelines(cal)
+
+            with open(ics_filename, "rb") as f:
+                st.success(f"✅ Found {len(events)} events.")
+                st.download_button("📥 Download .ics Calendar", f, file_name=ics_filename)
+
+            processed_hashes.add(file_hash)
+            save_processed_hashes()
+        else:
+            st.info("No events were detected in the calendar.")
